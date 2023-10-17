@@ -1,0 +1,116 @@
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- name: serviceConnection
+  value: primary
+- name: terraformVersion
+  value: 1.6.1
+- name: terraformStateResourceGroup
+  value: terraform-state
+- name: terraformStateStorageAccount
+  value: terraformstate
+- name: terraformStateContainer
+  value: terraform
+- name: terraformStateFile
+  value: terraform.tfstate
+
+stages:
+
+- stage: plan
+  displayName: Plan Deployment
+  jobs:
+  - job: plan
+    displayName: terraform plan
+    steps:
+    # Install Terraform
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(terraformVersion)
+    # Initialize Terraform - Download providers, setup remote state storage
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV2@2
+      displayName: 'terraform init'
+      inputs:
+        provider: 'azurerm'
+        command: init
+        backendServiceArm: $(serviceConnection)
+        backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+        backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+        backendAzureRmContainerName: $(terraformStateContainer)
+        backendAzureRmKey: $(terraformStateFile)
+        workingDirectory: '$(System.DefaultWorkingDirectory)/iac'
+    # Create Terraform plan
+    - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV2@2
+      displayName: 'terraform plan'
+      inputs:
+        provider: 'azurerm'
+        command: plan
+        commandOptions: '-out=$(Build.ArtifactStagingDirectory)/dev.tfplan -input=false'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/iac'
+        environmentServiceNameAzureRM: $(serviceConnection)
+    # Cleanup Terraform cache
+    - task: DeleteFiles@1
+      displayName: 'Delete ".terraform"'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)'
+        Contents: .terraform
+    # Publish Terraform plan output as an artifact
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact: dev.tfplan'
+      inputs:
+        ArtifactName: dev
+
+- stage: apply
+  displayName: Deploy
+  dependsOn: plan
+  jobs:
+  - deployment: apply
+    displayName: terraform apply
+    environment: dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Checkout repository (doesn't happen automatically for deploys)
+          - checkout: self
+            clean: true
+          # Retreive Terraform plan from previous job
+          - task: DownloadBuildArtifacts@0
+            displayName: Download Artifacts
+            inputs:
+              artifactName: dev
+              downloadPath: $(System.DefaultWorkingDirectory)
+          # Move tfplan and provider.tf to working directory
+          - script: |
+              mv $(System.DefaultWorkingDirectory)/dev/dev.tfplan $(System.DefaultWorkingDirectory)/dev.ncus.tfplan
+              cp $(System.DefaultWorkingDirectory)/iac/provider.tf $(System.DefaultWorkingDirectory)/provider.tf
+            displayName: Move Artifacts & Provider File
+          # Install Terraform
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+          # Initialize Terraform - Download providers, setup remote state storage
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV2@2
+            displayName: 'terraform init'
+            inputs:
+              provider: 'azurerm'
+              command: init
+              backendServiceArm: $(serviceConnection)
+              backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+              backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+              backendAzureRmContainerName: $(terraformStateContainer)
+              backendAzureRmKey: $(terraformStateFile)
+              workingDirectory: $(System.DefaultWorkingDirectory)
+          # Apply previously created Terraform plan
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-release-task.TerraformTaskV2@2
+            displayName: 'terraform apply'
+            inputs:
+              provider: 'azurerm'
+              command: apply
+              commandOptions: '-input=false dev.tfplan'
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              environmentServiceNameAzureRM: $(serviceConnection)
